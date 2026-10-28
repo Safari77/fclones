@@ -255,20 +255,25 @@ impl FsCommand {
     /// Returns a random temporary file name in the same directory, guaranteed to not collide with
     /// any other file in the same directory
     pub fn temp_file(path: &Path) -> Path {
-        let mut name = path
-            .file_name()
-            .expect("must be a regular file with a name");
-        name.push(".");
-        name.push(
-            rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(24)
-                .map(char::from)
-                .collect::<String>(),
-        );
-        match path.parent() {
-            Some(parent) => parent.join(Path::from(name)),
-            None => Path::from(name),
+        loop {
+            let mut name = path
+                .file_name()
+                .expect("must be a regular file with a name");
+            name.push(".");
+            name.push(
+                rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(24)
+                    .map(char::from)
+                    .collect::<String>(),
+            );
+            let tmp_path = match path.parent() {
+                Some(parent) => parent.join(Path::from(name)),
+                None => Path::from(name),
+            };
+            if !tmp_path.to_path_buf().exists() {
+                return tmp_path;
+            }
         }
     }
 
@@ -312,22 +317,22 @@ impl FsCommand {
     pub fn execute(&self, should_lock: bool, log: &dyn Log) -> io::Result<FileLen> {
         match self {
             FsCommand::Remove { file } => {
-                let _ = Self::maybe_lock(&file.path, should_lock)?;
+                let _lock = Self::maybe_lock(&file.path, should_lock)?;
                 Self::remove(&file.path)?;
                 Ok(file.metadata.len())
             }
             FsCommand::SoftLink { target, link } => {
-                let _ = Self::maybe_lock(&link.path, should_lock)?;
+                let _lock = Self::maybe_lock(&link.path, should_lock)?;
                 Self::safe_remove(&link.path, |link| Self::symlink(&target.path, link), log)?;
                 Ok(link.metadata.len())
             }
             FsCommand::HardLink { target, link } => {
-                let _ = Self::maybe_lock(&link.path, should_lock)?;
+                let _lock = Self::maybe_lock(&link.path, should_lock)?;
                 Self::safe_remove(&link.path, |link| Self::hardlink(&target.path, link), log)?;
                 Ok(link.metadata.len())
             }
             FsCommand::RefLink { target, link } => {
-                let _ = Self::maybe_lock(&link.path, should_lock)?;
+                let _lock = Self::maybe_lock(&link.path, should_lock)?;
                 crate::reflink::reflink(target, link, log)?;
                 Ok(link.metadata.len())
             }
@@ -336,7 +341,7 @@ impl FsCommand {
                 target,
                 use_rename,
             } => {
-                let _ = Self::maybe_lock(&source.path, should_lock);
+                let _lock = Self::maybe_lock(&source.path, should_lock)?;
                 let len = source.metadata.len();
                 if *use_rename && Self::move_rename(&source.path, target).is_ok() {
                     return Ok(len);
@@ -440,7 +445,7 @@ impl FsCommand {
                 let target = target.path.quote();
                 let link = link.path.quote();
                 result.push(format!("move {} {}", link, tmp.quote()));
-                result.push(format!("mklink {} {}", target, link));
+                result.push(format!("mklink {} {}", link, target));
                 result.push(format!("del {}", tmp.quote()));
             }
             FsCommand::HardLink { target, link, .. } => {
@@ -448,7 +453,7 @@ impl FsCommand {
                 let target = target.path.quote();
                 let link = link.path.quote();
                 result.push(format!("move {} {}", link, tmp.quote()));
-                result.push(format!("mklink /H {} {}", target, link));
+                result.push(format!("mklink /H {} {}", link, target));
                 result.push(format!("del {}", tmp.quote()));
             }
             FsCommand::RefLink { target, link, .. } => {
@@ -573,9 +578,8 @@ fn may_drop(path: &Path, config: &DedupeConfig) -> bool {
             .any(|p| p.matches_path(&path.to_path_buf()))
     };
 
-    (config.name_patterns.is_empty() && config.path_patterns.is_empty())
-        || matches_any_name()
-        || matches_any_path()
+    (config.name_patterns.is_empty() || matches_any_name())
+        && (config.path_patterns.is_empty() || matches_any_path())
 }
 
 impl<P: AsRef<PathAndMetadata>> FileSubGroup<P> {
@@ -1029,9 +1033,9 @@ pub fn log_script(
         // Process items in parallel in a background thread, so we can read as soon as they
         // are produced:
         s.spawn(move |_| {
-            script
-                .into_par_iter()
-                .for_each_with(tx, |tx, item| tx.send(item).unwrap())
+            script.into_par_iter().for_each_with(tx, |tx, item| {
+                let _ = tx.send(item);
+            })
         });
 
         let mut queue = PriorityQueue::new();

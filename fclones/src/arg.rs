@@ -126,10 +126,11 @@ pub fn from_stfu8(encoded: &str) -> Result<OsString, DecodeError> {
     Ok(OsString::from_wide(&raw_bytes))
 }
 
-const SPECIAL_CHARS: [char; 25] = [
-    '|', '&', ';', '<', '>', '(', ')', '{', '}', '$', '`', '\\', '\'', '"', ' ', '\t', '*', '?',
-    '+', '[', ']', '#', '˜', '=', '%',
-];
+/// Returns true if the character is guaranteed safe to leave unquoted in a Unix shell.
+#[inline]
+fn is_safe_shell_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '/' | '_' | '.' | '-')
+}
 
 /// Escapes special characters in a string, so that it will retain its literal meaning when used as
 /// a part of command in Unix shell.
@@ -137,20 +138,25 @@ const SPECIAL_CHARS: [char; 25] = [
 /// It tries to avoid introducing any unnecessary quotes or escape characters, but specifics
 /// regarding quoting style are left unspecified.
 pub fn quote(s: OsString) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let is_invalid_utf8 = s.to_str().is_none();
     let lossy = s.to_string_lossy();
-    if lossy
-        .chars()
-        .any(|c| c < '\u{20}' || c == '\u{7f}' || c == '\u{fffd}' || c == '\'')
+    if is_invalid_utf8
+        || lossy
+            .chars()
+            .any(|c| c < '\u{20}' || c == '\u{7f}' || c == '\'')
     {
         format!("$'{}'", to_stfu8(s).replace('\'', "\\'"))
-    } else if lossy.chars().any(|c| SPECIAL_CHARS.contains(&c)) {
+    } else if !lossy.chars().all(is_safe_shell_char) {
         format!("'{lossy}'")
     } else {
-        lossy.to_string()
+        lossy.into_owned()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub msg: String,
 }
@@ -203,6 +209,29 @@ fn append(s: &mut OsString, c: char) {
     s.push(c)
 }
 
+/// Unescapes `\'` and `\"` inside a `$'...'` slice in a single pass so escaped backslashes (`\\`)
+/// are preserved for STFU-8 decoding.
+fn unescape_dollar_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Splits command line into separate arguments, in much the same way Unix shell would, but without
 /// many of expansion the shell would perform.
 ///
@@ -243,14 +272,16 @@ pub fn split(s: &str) -> Result<Vec<Arg>, ParseError> {
     let mut words = Vec::new();
     let mut word = OsString::new();
 
-    let mut pos = 0;
     let mut dollar_quote_start = 0;
 
-    let mut chars = s.chars();
+    let mut chars = s.char_indices();
     let mut state = Delimiter;
 
     loop {
-        let c = chars.next();
+        let (pos, c) = match chars.next() {
+            Some((p, ch)) => (p, Some(ch)),
+            None => (s.len(), None),
+        };
         state = match state {
             Delimiter => match c {
                 None => break,
@@ -338,19 +369,44 @@ pub fn split(s: &str) -> Result<Vec<Arg>, ParseError> {
                 }
             },
             Dollar => match c {
-                None => return Err(ParseError::new("Unexpected end of input")),
+                None => {
+                    append(&mut word, '$');
+                    words.push(Arg(mem::replace(&mut word, OsString::new())));
+                    break;
+                }
                 Some('\'') => {
                     dollar_quote_start = pos + 1;
                     DollarQuoted
                 }
-                Some(_) => return Err(ParseError::new("Expected single quote")),
+                Some('\"') => {
+                    append(&mut word, '$');
+                    DoubleQuoted
+                }
+                Some('\\') => {
+                    append(&mut word, '$');
+                    UnquotedBackslash
+                }
+                Some('$') => {
+                    append(&mut word, '$');
+                    Dollar
+                }
+                Some('\t') | Some(' ') | Some('\n') => {
+                    append(&mut word, '$');
+                    words.push(Arg(mem::replace(&mut word, OsString::new())));
+                    Delimiter
+                }
+                Some(c) => {
+                    append(&mut word, '$');
+                    append(&mut word, c);
+                    Unquoted
+                }
             },
             DollarQuoted => match c {
                 None => return Err(ParseError::new("Unclosed single quote")),
                 Some('\\') => DollarQuotedBackslash,
                 Some('\'') => {
-                    let quoted_slice = &s[dollar_quote_start..pos].replace("\\'", "'");
-                    let decoded = from_stfu8(quoted_slice).map_err(|e| {
+                    let quoted_slice = unescape_dollar_quoted(&s[dollar_quote_start..pos]);
+                    let decoded = from_stfu8(&quoted_slice).map_err(|e| {
                         ParseError::new(format!("Failed to decode STFU-8 chunk: {e}").as_str())
                     })?;
                     word.push(decoded.as_os_str());
@@ -368,7 +424,6 @@ pub fn split(s: &str) -> Result<Vec<Arg>, ParseError> {
                 Some(_) => Comment,
             },
         };
-        pos += 1;
     }
 
     Ok(words)
@@ -383,7 +438,7 @@ pub fn join(args: &[Arg]) -> String {
 mod test {
     use std::ffi::OsString;
 
-    use crate::arg::{quote, split, Arg};
+    use crate::arg::{join, quote, split, Arg};
 
     #[test]
     fn quote_no_special_chars() {
@@ -391,9 +446,21 @@ mod test {
     }
 
     #[test]
+    fn quote_empty_string() {
+        assert_eq!(quote(OsString::from("")), "''");
+        assert_eq!(
+            split(&quote(OsString::from(""))).unwrap(),
+            vec![Arg::from("")]
+        );
+    }
+
+    #[test]
     fn quote_path_with_control_chars() {
         assert_eq!(quote(OsString::from("a\nb")), "$'a\\nb'");
         assert_eq!(quote(OsString::from("a\tb")), "$'a\\tb'");
+        assert_eq!(quote(OsString::from("a\rb")), "$'a\\rb'");
+        assert_eq!(quote(OsString::from("a\x00b")), "$'a\\x00b'");
+        assert_eq!(quote(OsString::from("a\x7fb")), "$'a\\x7Fb'");
     }
 
     #[test]
@@ -407,9 +474,52 @@ mod test {
     }
 
     #[test]
+    fn quote_malicious_command_injection_filenames() {
+        assert_eq!(
+            quote(OsString::from("hi.txt;echo pwned")),
+            "'hi.txt;echo pwned'"
+        );
+        assert_eq!(quote(OsString::from("$(id)")), "'$(id)'");
+        assert_eq!(quote(OsString::from("`uname -a`")), "'`uname -a`'");
+        assert_eq!(
+            quote(OsString::from("foo | sh && rm -rf /ohno")),
+            "'foo | sh && rm -rf /ohno'"
+        );
+        assert_eq!(quote(OsString::from("a>b<c")), "'a>b<c'");
+        assert_eq!(
+            quote(OsString::from("file\necho pwned\n")),
+            "$'file\\necho pwned\\n'"
+        );
+    }
+
+    #[test]
+    fn quote_tilde_history_and_glob_characters() {
+        // Ensures ASCII tilde U+007E (not just U+02DC) is quoted
+        assert_eq!(quote(OsString::from("~")), "'~'");
+        assert_eq!(quote(OsString::from("~/secret")), "'~/secret'");
+        assert_eq!(quote(OsString::from("~root/.ssh")), "'~root/.ssh'");
+
+        // Ensures history expansion (!) and zsh extended globs (^) are quoted
+        assert_eq!(quote(OsString::from("!-1")), "'!-1'");
+        assert_eq!(quote(OsString::from("foo!bar")), "'foo!bar'");
+        assert_eq!(quote(OsString::from("foo^bar")), "'foo^bar'");
+    }
+
+    #[test]
+    fn quote_unicode_whitespace_and_control_chars() {
+        // Non-breaking space (U+00A0) and C1 control character (U+0085) are non-ASCII,
+        // so the allowlist places them in single quotes
+        assert_eq!(quote(OsString::from("a\u{00a0}b")), "'a\u{00a0}b'");
+        assert_eq!(quote(OsString::from("a\u{0085}b")), "'a\u{0085}b'");
+        // Valid UTF-8 replacement character U+FFFD is single-quoted (not treated as invalid UTF-8)
+        assert_eq!(quote(OsString::from("a\u{fffd}b")), "'a\u{fffd}b'");
+    }
+
+    #[test]
     fn quote_path_with_single_quotes() {
         assert_eq!(quote(OsString::from("a'b")), "$'a\\'b'");
         assert_eq!(quote(OsString::from("a'b'")), "$'a\\'b\\''");
+        assert_eq!(quote(OsString::from("a\\'b")), "$'a\\\\\\'b'");
     }
 
     #[test]
@@ -450,6 +560,18 @@ mod test {
             split("$'single\\'quote'").unwrap(),
             vec![Arg::from("single'quote")]
         );
+        assert_eq!(
+            split("$'backslash\\\\\\'quote'").unwrap(),
+            vec![Arg::from("backslash\\'quote")]
+        );
+        assert_eq!(
+            split("$'escaped\\\"doublequote'").unwrap(),
+            vec![Arg::from("escaped\"doublequote")]
+        );
+        assert_eq!(
+            split("$'backslash\\\\\"doublequote'").unwrap(),
+            vec![Arg::from("backslash\\\"doublequote")]
+        );
     }
 
     #[test]
@@ -470,5 +592,104 @@ mod test {
                 Arg::from("arg3-\x7f")
             ]
         )
+    }
+
+    #[test]
+    fn split_multibyte_utf8_with_dollar_quoting() {
+        // Multi-byte UTF-8 before, inside, and after $'...' must not panic or corrupt slices
+        assert_eq!(
+            split("ą $'foo\\nbar'").unwrap(),
+            vec![Arg::from("ą"), Arg::from("foo\nbar")]
+        );
+        assert_eq!(
+            split("🦀 $'zażółć\\ngęślą\\njaźń' 🌸").unwrap(),
+            vec![
+                Arg::from("🦀"),
+                Arg::from("zażółć\ngęślą\njaźń"),
+                Arg::from("🌸")
+            ]
+        );
+        assert_eq!(split("$'中\\'文'").unwrap(), vec![Arg::from("中'文")]);
+    }
+
+    #[test]
+    fn split_unquoted_dollar_signs() {
+        assert_eq!(
+            split("$HOME foo$bar price$ $ $$ $'a\\nb' $$$'c\\nd'").unwrap(),
+            vec![
+                Arg::from("$HOME"),
+                Arg::from("foo$bar"),
+                Arg::from("price$"),
+                Arg::from("$"),
+                Arg::from("$$"),
+                Arg::from("a\nb"),
+                Arg::from("$$c\nd"),
+            ]
+        );
+        assert_eq!(
+            split("$\"quoted\" $\\ space").unwrap(),
+            vec![Arg::from("$quoted"), Arg::from("$ space")]
+        );
+    }
+
+    #[test]
+    fn roundtrip_quote_and_split_edge_cases() {
+        let cases = vec![
+            "",
+            " ",
+            "   ",
+            "simple_file.txt",
+            "-rf",
+            "--no-preserve-root",
+            "hi.txt;echo pwned",
+            "$(reboot)",
+            "`id`",
+            "~",
+            "~/Documents",
+            "~root/file",
+            "!history",
+            "a'b",
+            "a\\'b",
+            "a\\\\'b",
+            "a\"b",
+            "a\\\"b",
+            "it's a \"quoted\" ' nightmare \\ \n \t \r \x07 \x7f",
+            "zażółć gęślą jaźń",
+            "🦀'🌸\n日本語",
+            "$VAR",
+            "${VAR}",
+            "$$",
+            "#comment_lookalike",
+            "mid#hash",
+            "trailing_backslash\\",
+        ];
+
+        let args: Vec<Arg> = cases.into_iter().map(Arg::from).collect();
+        let joined = join(&args);
+        let parsed = split(&joined).unwrap();
+        assert_eq!(parsed, args);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn roundtrip_non_utf8_bytes_unix() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![
+            b'f', b'o', b'o', 0x80, 0xfe, 0xff, b'\'', b'\\', b'\n',
+        ]);
+        let arg = Arg::from(raw);
+        let quoted = arg.quote();
+        assert_eq!(quoted, "$'foo\\x80\\xFE\\xFF\\'\\\\\\n'");
+        let parsed = split(&quoted).unwrap();
+        assert_eq!(parsed, vec![arg]);
+    }
+
+    #[test]
+    fn split_error_cases() {
+        assert!(split("'unclosed single").is_err());
+        assert!(split("\"unclosed double").is_err());
+        assert!(split("$'unclosed dollar").is_err());
+        assert!(split("\"trailing backslash\\").is_err());
+        assert!(split("$'trailing backslash\\").is_err());
     }
 }

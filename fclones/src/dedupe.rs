@@ -378,36 +378,36 @@ impl FsCommand {
         match self {
             FsCommand::Remove { file, .. } => {
                 let path = file.path.quote();
-                result.push(format!("rm {path}"));
+                result.push(format!("rm -- {path}"));
             }
             FsCommand::SoftLink { target, link, .. } => {
                 let tmp = Self::temp_file(&link.path);
                 let target = target.path.quote();
                 let link = link.path.quote();
-                result.push(format!("mv {} {}", link, tmp.quote()));
-                result.push(format!("ln -s {target} {link}"));
-                result.push(format!("rm {}", tmp.quote()));
+                result.push(format!("mv -- {} {}", link, tmp.quote()));
+                result.push(format!("ln -s -- {target} {link}"));
+                result.push(format!("rm -- {}", tmp.quote()));
             }
             FsCommand::HardLink { target, link, .. } => {
                 let tmp = Self::temp_file(&link.path);
                 let target = target.path.quote();
                 let link = link.path.quote();
-                result.push(format!("mv {} {}", link, tmp.quote()));
-                result.push(format!("ln {target} {link}"));
-                result.push(format!("rm {}", tmp.quote()));
+                result.push(format!("mv -- {} {}", link, tmp.quote()));
+                result.push(format!("ln -- {target} {link}"));
+                result.push(format!("rm -- {}", tmp.quote()));
             }
             FsCommand::RefLink { target, link, .. } => {
                 let tmp = Self::temp_file(&link.path);
                 let target = target.path.quote();
                 let link = link.path.quote();
                 // Not really what happens on Linux, there the `mv` is also a reflink.
-                result.push(format!("mv {} {}", link, tmp.quote()));
+                result.push(format!("mv -- {} {}", link, tmp.quote()));
                 if cfg!(target_os = "macos") {
-                    result.push(format!("cp -c {target} {link}"));
+                    result.push(format!("cp -c -- {target} {link}"));
                 } else {
-                    result.push(format!("cp --reflink=always {target} {link}"));
+                    result.push(format!("cp --reflink=always -- {target} {link}"));
                 };
-                result.push(format!("rm {}", tmp.quote()));
+                result.push(format!("rm -- {}", tmp.quote()));
             }
             FsCommand::Move {
                 source,
@@ -417,10 +417,10 @@ impl FsCommand {
                 let source = source.path.quote();
                 let target = target.quote();
                 if *use_rename {
-                    result.push(format!("mv {} {}", &source, &target));
+                    result.push(format!("mv -- {} {}", &source, &target));
                 } else {
-                    result.push(format!("cp {} {}", &source, &target));
-                    result.push(format!("rm {}", &source));
+                    result.push(format!("cp -- {} {}", &source, &target));
+                    result.push(format!("rm -- {}", &source));
                 }
             }
         }
@@ -1629,5 +1629,67 @@ mod test {
             assert_eq!(read_file(&file_a1), "foo");
             assert_eq!(read_file(&file_a2), "foo");
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_str_security_tests {
+    use super::*;
+    use crate::path::Path;
+    use std::sync::Arc;
+
+    fn dummy_file(path_str: &str) -> PathAndMetadata {
+        let metadata = FileMetadata::new(&Path::from(".")).unwrap();
+        PathAndMetadata {
+            path: Path::from(path_str),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn remove_prevents_command_and_option_injection() {
+        let cmd_inject = FsCommand::Remove {
+            file: dummy_file("hi.txt;echo pwned"),
+        };
+        assert_eq!(cmd_inject.to_shell_str(), vec!["rm -- 'hi.txt;echo pwned'"]);
+
+        let opt_inject = FsCommand::Remove {
+            file: dummy_file("-rf /ohno"),
+        };
+        assert_eq!(opt_inject.to_shell_str(), vec!["rm -- '-rf /ohno'"]);
+
+        let flag_only = FsCommand::Remove {
+            file: dummy_file("--help"),
+        };
+        assert_eq!(flag_only.to_shell_str(), vec!["rm -- --help"]);
+    }
+
+    #[test]
+    fn move_prevents_command_and_option_injection() {
+        let cmd = FsCommand::Move {
+            source: dummy_file("$(id).txt"),
+            target: Path::from("`uname`;rm -rf /ohno"),
+            use_rename: false,
+        };
+        assert_eq!(
+            cmd.to_shell_str(),
+            vec![
+                "cp -- '$(id).txt' '`uname`;rm -rf /ohno'",
+                "rm -- '$(id).txt'",
+            ]
+        );
+    }
+
+    #[test]
+    fn softlink_and_hardlink_include_double_dash_delimiters() {
+        let cmd = FsCommand::SoftLink {
+            target: Arc::new(dummy_file("-target_flag")),
+            link: dummy_file("link'with'quote;id"),
+        };
+        let cmds = cmd.to_shell_str();
+        assert_eq!(cmds.len(), 3);
+        assert!(cmds[0].starts_with("mv -- $'link\\'with\\'quote;id' "));
+        assert_eq!(cmds[1], "ln -s -- -target_flag $'link\\'with\\'quote;id'");
+        assert!(cmds[2].starts_with("rm -- "));
     }
 }
